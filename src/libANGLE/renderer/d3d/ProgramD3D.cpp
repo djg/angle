@@ -1488,8 +1488,10 @@ void ProgramD3D::updateCachedOutputLayoutFromShader()
 class ProgramD3D::GetGeometryExecutableTask : public ProgramD3D::GetExecutableTask
 {
   public:
-    GetGeometryExecutableTask(ProgramD3D *program, const gl::Context *context)
-        : GetExecutableTask(program), mContext(context)
+    GetGeometryExecutableTask(ProgramD3D *program,
+                              const gl::Context *context,
+                              GLenum drawMode)
+        : GetExecutableTask(program), mContext(context), mDrawMode(drawMode)
     {
     }
 
@@ -1497,9 +1499,9 @@ class ProgramD3D::GetGeometryExecutableTask : public ProgramD3D::GetExecutableTa
     {
         // Auto-generate the geometry shader here, if we expect to be using point rendering in
         // D3D11.
-        if (mProgram->usesGeometryShader(GL_POINTS))
+        if (mProgram->usesGeometryShader(mDrawMode))
         {
-            ANGLE_TRY(mProgram->getGeometryExecutableForPrimitiveType(mContext, GL_POINTS, &mResult,
+            ANGLE_TRY(mProgram->getGeometryExecutableForPrimitiveType(mContext, mDrawMode, &mResult,
                                                                       &mInfoLog));
         }
 
@@ -1508,6 +1510,7 @@ class ProgramD3D::GetGeometryExecutableTask : public ProgramD3D::GetExecutableTa
 
   private:
     const gl::Context *mContext;
+    GLenum mDrawMode;
 };
 
 gl::Error ProgramD3D::getComputeExecutable(ShaderExecutableD3D **outExecutable)
@@ -1530,11 +1533,19 @@ gl::LinkResult ProgramD3D::compileProgramExecutables(const gl::Context *context,
 
     GetVertexExecutableTask vertexTask(this, context);
     GetPixelExecutableTask pixelTask(this);
-    GetGeometryExecutableTask geometryTask(this, context);
+    // These can't be an array becaude GetGeometryExecutableTask deletes
+    // copy constructor.
+    GetGeometryExecutableTask geometryTaskPoints(this, context, GL_POINTS);
+    GetGeometryExecutableTask geometryTaskLines(this, context, GL_LINES);
+    GetGeometryExecutableTask geometryTaskTris(this, context, GL_TRIANGLES);
+    GetGeometryExecutableTask geometryTaskTriStrip(this, context, GL_TRIANGLE_STRIP);
 
-    std::array<WaitableEvent, 3> waitEvents = {{workerPool->postWorkerTask(&vertexTask),
+    std::array<WaitableEvent, 6> waitEvents = {{workerPool->postWorkerTask(&vertexTask),
                                                 workerPool->postWorkerTask(&pixelTask),
-                                                workerPool->postWorkerTask(&geometryTask)}};
+                                                workerPool->postWorkerTask(&geometryTaskPoints),
+                                                workerPool->postWorkerTask(&geometryTaskLines),
+                                                workerPool->postWorkerTask(&geometryTaskTris),
+                                                workerPool->postWorkerTask(&geometryTaskTriStrip)}};
 
     WaitableEvent::WaitMany(&waitEvents);
 
@@ -1546,30 +1557,48 @@ gl::LinkResult ProgramD3D::compileProgramExecutables(const gl::Context *context,
     {
         infoLog << pixelTask.getInfoLog().str();
     }
-    if (!geometryTask.getInfoLog().empty())
-    {
-        infoLog << geometryTask.getInfoLog().str();
+    if (!geometryTaskPoints.getInfoLog().empty()) {
+        infoLog << geometryTaskPoints.getInfoLog().str();
+    }
+    if (!geometryTaskLines.getInfoLog().empty()) {
+        infoLog << geometryTaskLines.getInfoLog().str();
+    }
+    if (!geometryTaskTris.getInfoLog().empty()) {
+        infoLog << geometryTaskTris.getInfoLog().str();
+    }
+    if (!geometryTaskTriStrip.getInfoLog().empty()) {
+        infoLog << geometryTaskTriStrip.getInfoLog().str();
     }
 
     ANGLE_TRY(vertexTask.getError());
     ANGLE_TRY(pixelTask.getError());
-    ANGLE_TRY(geometryTask.getError());
+    ANGLE_TRY(geometryTaskPoints.getError());
+    ANGLE_TRY(geometryTaskLines.getError());
+    ANGLE_TRY(geometryTaskTris.getError());
+    ANGLE_TRY(geometryTaskTriStrip.getError());
 
     ShaderExecutableD3D *defaultVertexExecutable = vertexTask.getResult();
     ShaderExecutableD3D *defaultPixelExecutable  = pixelTask.getResult();
-    ShaderExecutableD3D *pointGS                 = geometryTask.getResult();
+    std::array<ShaderExecutableD3D*, 4> defaultGeomExecutable = {geometryTaskPoints.getResult(),
+                                                                 geometryTaskLines.getResult(),
+                                                                 geometryTaskTris.getResult(),
+                                                                 geometryTaskTriStrip.getResult()};
 
     const ShaderD3D *vertexShaderD3D =
         GetImplAs<ShaderD3D>(mState.getAttachedShader(gl::ShaderType::Vertex));
 
-    if (usesGeometryShader(GL_POINTS) && pointGS)
-    {
-        // Geometry shaders are currently only used internally, so there is no corresponding shader
-        // object at the interface level. For now the geometry shader debug info is prepended to
-        // the vertex shader.
-        vertexShaderD3D->appendDebugInfo("// GEOMETRY SHADER BEGIN\n\n");
-        vertexShaderD3D->appendDebugInfo(pointGS->getDebugInfo());
-        vertexShaderD3D->appendDebugInfo("\nGEOMETRY SHADER END\n\n\n");
+    std::array<GLenum, 4> drawModes = {GL_POINTS, GL_LINES, GL_TRIANGLES, GL_TRIANGLE_STRIP};
+
+    for (int gs = 0; gs < 4; gs++) {
+        if (usesGeometryShader(drawModes[gs]) && defaultGeomExecutable[gs])
+        {
+            // Geometry shaders are currently only used internally, so there is no corresponding shader
+            // object at the interface level. For now the geometry shader debug info is prepended to
+            // the vertex shader.
+            vertexShaderD3D->appendDebugInfo("// GEOMETRY SHADER BEGIN\n\n");
+            vertexShaderD3D->appendDebugInfo(defaultGeomExecutable[gs]->getDebugInfo());
+            vertexShaderD3D->appendDebugInfo("\nGEOMETRY SHADER END\n\n\n");
+        }
     }
 
     if (defaultVertexExecutable)
@@ -1585,7 +1614,10 @@ gl::LinkResult ProgramD3D::compileProgramExecutables(const gl::Context *context,
     }
 
     return (defaultVertexExecutable && defaultPixelExecutable &&
-            (!usesGeometryShader(GL_POINTS) || pointGS));
+            (!usesGeometryShader(GL_POINTS) || defaultGeomExecutable[0]) &&
+            (!usesGeometryShader(GL_LINES) || defaultGeomExecutable[1]) &&
+            (!usesGeometryShader(GL_TRIANGLES) || defaultGeomExecutable[2]) &&
+            (!usesGeometryShader(GL_TRIANGLE_STRIP) || defaultGeomExecutable[3]));
 }
 
 gl::LinkResult ProgramD3D::compileComputeExecutable(const gl::Context *context,
